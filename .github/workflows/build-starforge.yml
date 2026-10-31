@@ -1,0 +1,133 @@
+name: Star Forge IPA
+
+# Builds an unsigned IPA on a GitHub-hosted macOS runner, so no local Mac is
+# required. The submodules are fetched at the exact commits pinned by upstream
+# TelegramMessenger/Telegram-iOS master, so the source is pushed as plain files.
+#
+# Trigger from the "Actions" tab (Run workflow), or with:
+#   gh workflow run build-starforge.yml
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image (needs a recent Xcode)"
+        required: false
+        default: "macos-latest"
+      xcode_version:
+        description: "Xcode version (empty = auto-select from versions.json)"
+        required: false
+        default: ""
+      build_number:
+        description: "Build number"
+        required: false
+        default: "100001"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Submodules are NOT stored in this repository (the source was
+          # uploaded as plain files). They are cloned in the next step at the
+          # exact commits upstream pins.
+          submodules: false
+          fetch-depth: "0"
+
+      - name: Select Xcode
+        run: |
+          set -euxo pipefail
+          WANT="${{ inputs.xcode_version }}"
+          if [ -z "$WANT" ]; then
+            WANT="$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')"
+          fi
+          echo "requested Xcode: $WANT"
+          INSTALLED="$(xcodebuild -version | head -n1 | awk '{print $2}')"
+          echo "installed Xcode: $INSTALLED"
+          if [ -d "/Applications/Xcode_${WANT}.app" ]; then
+            sudo xcode-select -s "/Applications/Xcode_${WANT}.app/Contents/Developer"
+          else
+            echo "::warning::Xcode ${WANT} is not present on this runner; building with ${INSTALLED}"
+          fi
+          xcodebuild -version
+
+      - name: Fetch pinned submodules
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          # path, url, pinned commit (from TelegramMessenger/Telegram-iOS master)
+          submodules = [
+              ("submodules/rlottie/rlottie", "https://github.com/TelegramMessenger/rlottie.git", "53c9679069eb6b6513ccc3c892ef4f4a760658da"),
+              ("build-system/bazel-rules/rules_apple", "https://github.com/ali-fareed/rules_apple.git", "485016eb5b0948cc17307064e7977a6d68e94046"),
+              ("build-system/bazel-rules/rules_swift", "https://github.com/bazelbuild/rules_swift.git", "dd10a2497a691237eb9716586acee1a9c4fe3e59"),
+              ("build-system/bazel-rules/apple_support", "https://github.com/bazelbuild/apple_support.git", "872de7149cfbcaaf854c7867e98b6d4798ba0d27"),
+              ("submodules/TgVoipWebrtc/tgcalls", "https://github.com/TelegramMessenger/tgcalls.git", "8d6dd4c61e62965cb574c29e39327a4686066381"),
+              ("third-party/libvpx/libvpx", "https://github.com/webmproject/libvpx.git", "e7bfd8b6c230a6824e7fd1efa2378a7322986128"),
+              ("third-party/webrtc/webrtc", "https://github.com/ali-fareed/webrtc.git", "6513c71d6c80311d69a0a6b9c09fcf32cfbeb247"),
+              ("build-system/bazel-rules/rules_xcodeproj", "https://github.com/MobileNativeFoundation/rules_xcodeproj.git", "f6a54168d19f917d0630e7d4efa8f2f9fa0ddc36"),
+              ("third-party/dav1d/dav1d", "https://github.com/ali-fareed/dav1d.git", "330e20672e85f9de1678dccd6957845898ef57a1"),
+              ("third-party/td/td", "https://github.com/tdlib/td", "e894536b2f46caad93f997448d2daff9431b19dd"),
+              ("third-party/wallet-engine/wallet-engine", "https://github.com/i582/wallet-engine.git", "e59e0d89d7ee90c388bf36e3334c5b276f396697"),
+              ("submodules/tlottie/tlottie", "https://github.com/dkaraush/tlottie.git", "92df98dc209bc39b1e567ec74a8c86a0af5239de"),
+              ("third-party/mtproto-engine", "https://github.com/TelegramMessenger/mtproto-engine.git", "da4b2170210aab0430c4ff18c032991f3030cf45"),
+          ]
+
+          for path, url, sha in submodules:
+              if os.path.isdir(path) and os.listdir(path):
+                  print("already present:", path)
+                  continue
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              print("cloning", path, "at", sha)
+              try:
+                  subprocess.check_call(["git", "clone", "--filter=blob:none", "--no-checkout", "--quiet", url, path])
+                  subprocess.check_call(["git", "-C", path, "checkout", "--quiet", sha])
+              except subprocess.CalledProcessError:
+                  print("partial clone failed, falling back to full clone for", path)
+                  if os.path.isdir(path):
+                      subprocess.check_call(["rm", "-rf", path])
+                  subprocess.check_call(["git", "clone", "--quiet", url, path])
+                  subprocess.check_call(["git", "-C", path, "checkout", "--quiet", sha])
+              try:
+                  subprocess.check_call(["git", "-C", path, "submodule", "update", "--init", "--recursive", "--depth", "1"])
+              except subprocess.CalledProcessError as exc:
+                  print("::warning::nested submodules for {} not fully fetched: {}".format(path, exc))
+          PY
+
+      - name: Build the app
+        run: |
+          set -euxo pipefail
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs || true
+          python3 -u build-system/Make/Make.py \
+            --cacheDir="$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="${{ inputs.build_number }}" \
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts" \
+            --overrideXcodeVersion
+
+      - name: Locate IPA
+        id: locate
+        run: |
+          set -euxo pipefail
+          IPA="$(find "$GITHUB_WORKSPACE" -name 'Telegram.ipa' -type f | head -n1)"
+          if [ -z "$IPA" ]; then
+            echo "::error::Telegram.ipa was not produced"
+            exit 1
+          fi
+          echo "ipa=$IPA" >> "$GITHUB_OUTPUT"
+          cp "$IPA" "$GITHUB_WORKSPACE/Telegram.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-ipa
+          path: ${{ github.workspace }}/Telegram.ipa
+          if-no-files-found: error
