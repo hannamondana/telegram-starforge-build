@@ -106,12 +106,52 @@ jobs:
       - name: Refresh fake provisioning profiles
         run: |
           set -eux
-          # The bundled Apple profiles expired on 2026-10-30, which makes Bazel's
-          # plisttool fail with "provisioning profile ExpirationDate (...) is in
-          # the past". rules_apple accepts a plain XML plist in place of a
-          # CMS-signed one, so the script rewrites the embedded plist with a
-          # future expiry. Idempotent: already-refreshed profiles are untouched.
-          python3 build-system/fake-codesigning/refresh_profiles.py build-system/fake-codesigning/profiles
+          # The bundled Apple profiles expired on 2026-10-30. They cannot simply
+          # be re-dated: BuildConfiguration.py decodes them with
+          # `openssl smime -verify` (so they must stay real CMS blobs) and
+          # plisttool rejects an ExpirationDate in the past. The script decodes
+          # each one, re-dates it, and re-signs it with certs/SelfSigned.p12 --
+          # the same flow GenerateProfiles.py uses. Idempotent.
+          python3 build-system/fake-codesigning/refresh_profiles.py build-system/fake-codesigning
+
+      - name: Verify provisioning profiles
+        run: |
+          set -eux
+          # Decode exactly the way BuildConfiguration.py does, so a bad profile
+          # fails here in seconds instead of after a long Bazel build.
+          python3 - <<'PY'
+          import datetime
+          import glob
+          import plistlib
+          import subprocess
+          import sys
+
+          problems = []
+          for path in sorted(glob.glob('build-system/fake-codesigning/profiles/*.mobileprovision')):
+              name = path.replace('\\', '/').split('/')[-1]
+              proc = subprocess.run(
+                  ['openssl', 'smime', '-inform', 'der', '-verify', '-noverify', '-in', path],
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if proc.returncode != 0:
+                  problems.append('{}: openssl smime failed: {}'.format(
+                      name, proc.stderr.decode('utf-8', 'replace').strip()))
+                  continue
+              try:
+                  profile = plistlib.loads(proc.stdout)
+              except Exception as error:
+                  problems.append('{}: not a plist: {}'.format(name, error))
+                  continue
+              expiration = profile.get('ExpirationDate')
+              if not expiration or expiration < datetime.datetime.now():
+                  problems.append('{}: ExpirationDate {} is in the past'.format(name, expiration))
+                  continue
+              print('  {}: ok, expires {}'.format(name, expiration))
+
+          if problems:
+              print('\n'.join(problems))
+              sys.exit(1)
+          print('All provisioning profiles are decodable and unexpired.')
+          PY
 
       - name: Build the app
         run: |
