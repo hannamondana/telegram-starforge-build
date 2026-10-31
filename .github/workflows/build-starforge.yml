@@ -49,6 +49,8 @@ jobs:
           echo "$XCODE_OUT"
           INSTALLED="$(printf '%s\n' "$XCODE_OUT" | awk 'NR==1{print $2}')"
           echo "installed Xcode: $INSTALLED"
+          echo "available Xcodes on this runner:"
+          ls /Applications | grep -i '^Xcode' || true
           if [ -d "/Applications/Xcode_${WANT}.app" ]; then
             sudo xcode-select -s "/Applications/Xcode_${WANT}.app/Contents/Developer"
           else
@@ -107,13 +109,13 @@ jobs:
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs || true
           python3 -u build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
+            --overrideXcodeVersion \
             build \
             --configurationPath=build-system/appstore-configuration.json \
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber="${{ inputs.build_number }}" \
-            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts" \
-            --overrideXcodeVersion
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts"
 
       - name: Locate IPA
         id: locate
