@@ -103,6 +103,16 @@ jobs:
                   print("::warning::nested submodules for {} not fully fetched: {}".format(path, exc))
           PY
 
+      - name: Refresh fake provisioning profiles
+        run: |
+          set -eux
+          # The bundled Apple profiles expired on 2026-10-30, which makes Bazel's
+          # plisttool fail with "provisioning profile ExpirationDate (...) is in
+          # the past". rules_apple accepts a plain XML plist in place of a
+          # CMS-signed one, so the script rewrites the embedded plist with a
+          # future expiry. Idempotent: already-refreshed profiles are untouched.
+          python3 build-system/fake-codesigning/refresh_profiles.py build-system/fake-codesigning/profiles
+
       - name: Build the app
         run: |
           set -euxo pipefail
@@ -120,9 +130,14 @@ jobs:
       - name: Locate IPA
         id: locate
         run: |
-          set -euxo pipefail
-          IPA="$(find "$GITHUB_WORKSPACE" -name 'Telegram.ipa' -type f | head -n1)"
-          if [ -z "$IPA" ]; then
+          set -eux
+          IPA="$GITHUB_WORKSPACE/build-artifacts/Telegram.ipa"
+          if [ ! -f "$IPA" ]; then
+            # Fallback: -quit stops find after the first hit, so nothing gets
+            # SIGPIPE'd by an early-closing pipe reader (which breaks pipefail).
+            IPA="$(find "$GITHUB_WORKSPACE" -name 'Telegram.ipa' -type f -print -quit)"
+          fi
+          if [ -z "$IPA" ] || [ ! -f "$IPA" ]; then
             echo "::error::Telegram.ipa was not produced"
             exit 1
           fi
