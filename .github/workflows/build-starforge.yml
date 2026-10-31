@@ -39,20 +39,22 @@ jobs:
 
       - name: Select Xcode
         run: |
-          set -euxo pipefail
+          set -eux
           WANT="${{ inputs.xcode_version }}"
           if [ -z "$WANT" ]; then
             WANT="$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')"
           fi
           echo "requested Xcode: $WANT"
-          INSTALLED="$(xcodebuild -version | head -n1 | awk '{print $2}')"
+          XCODE_OUT="$(xcodebuild -version 2>&1 || true)"
+          echo "$XCODE_OUT"
+          INSTALLED="$(printf '%s\n' "$XCODE_OUT" | awk 'NR==1{print $2}')"
           echo "installed Xcode: $INSTALLED"
           if [ -d "/Applications/Xcode_${WANT}.app" ]; then
             sudo xcode-select -s "/Applications/Xcode_${WANT}.app/Contents/Developer"
           else
             echo "::warning::Xcode ${WANT} is not present on this runner; building with ${INSTALLED}"
           fi
-          xcodebuild -version
+          xcodebuild -version || true
 
       - name: Fetch pinned submodules
         run: |
