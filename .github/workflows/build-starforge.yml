@@ -147,6 +147,58 @@ jobs:
           print('patched', path)
           PY
 
+      - name: Disable the SIL pass that crashes the compiler
+        run: |
+          set -eux
+          # Swift 6.3.3 (Xcode 26.6) crashes while compiling the ShareScreen
+          # module:
+          #   While running pass "CopyPropagation" on SILFunction
+          #     ...ShareScreen...init(context:subject:...)
+          #     at Sources/ShareScreen.swift:322:12
+          #   visitUsersOutsideLinearLivenessBoundary ->
+          #     OSSACanonicalizeOwned::extendLexicalLivenessToDeadEnds ->
+          #     llvm::report_fatal_error
+          # The module's 37-argument initializer trips an OSSA lifetime
+          # canonicalization bug in that pass. Upstream never sees it because
+          # it builds with the 27.1 toolchain. CopyPropagation only forwards
+          # copies, so disabling it keeps semantics identical; the cost is a
+          # negligible amount of optimization in this one module.
+          python3 - <<'PY'
+          import sys
+
+          path = 'submodules/TelegramUI/Components/ShareScreen/BUILD'
+          with open(path, 'r', encoding='utf-8') as handle:
+              source = handle.read()
+
+          if 'sil-disable-pass=CopyPropagation' in source:
+              print('ShareScreen/BUILD: pass already disabled')
+              sys.exit(0)
+
+          old = (
+              '    copts = [\n'
+              '        "-warnings-as-errors",\n'
+              '    ],\n'
+          )
+          new = (
+              '    copts = [\n'
+              '        "-warnings-as-errors",\n'
+              '        # Star Forge: Swift 6.3.3 crashes in CopyPropagation while\n'
+              '        # canonicalizing OSSA lifetimes of the huge init below.\n'
+              '        "-Xllvm",\n'
+              '        "-sil-disable-pass=CopyPropagation",\n'
+              '    ],\n'
+          )
+
+          if old not in source:
+              print('::error::unexpected formatting of the ShareScreen copts block')
+              sys.exit(1)
+
+          with open(path, 'w', encoding='utf-8') as handle:
+              handle.write(source.replace(old, new, 1))
+          print('patched', path)
+          PY
+          grep -n -A 6 'copts = \[' submodules/TelegramUI/Components/ShareScreen/BUILD
+
       - name: Restore executable bits on shell scripts
         run: |
           set -eux
