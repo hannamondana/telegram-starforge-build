@@ -147,57 +147,27 @@ jobs:
           print('patched', path)
           PY
 
-      - name: Disable the SIL pass that crashes the compiler
+      - name: Disable the SIL passes that crash the compiler
         run: |
           set -eux
-          # Swift 6.3.3 (Xcode 26.6) crashes while compiling the ShareScreen
+          # Swift 6.3.3 (Xcode 26.6) crashes while optimizing the ShareScreen
           # module:
-          #   While running pass "CopyPropagation" on SILFunction
-          #     ...ShareScreen...init(context:subject:...)
+          #   While running pass "CopyPropagation" / "SILCombine" on
+          #     SILFunction ...ShareScreen...init(context:subject:...)
           #     at Sources/ShareScreen.swift:322:12
           #   visitUsersOutsideLinearLivenessBoundary ->
           #     OSSACanonicalizeOwned::extendLexicalLivenessToDeadEnds ->
           #     llvm::report_fatal_error
-          # The module's 37-argument initializer trips an OSSA lifetime
-          # canonicalization bug in that pass. Upstream never sees it because
-          # it builds with the 27.1 toolchain. CopyPropagation only forwards
-          # copies, so disabling it keeps semantics identical; the cost is a
-          # negligible amount of optimization in this one module.
-          python3 - <<'PY'
-          import sys
-
-          path = 'submodules/TelegramUI/Components/ShareScreen/BUILD'
-          with open(path, 'r', encoding='utf-8') as handle:
-              source = handle.read()
-
-          if 'sil-disable-pass=CopyPropagation' in source:
-              print('ShareScreen/BUILD: pass already disabled')
-              sys.exit(0)
-
-          old = (
-              '    copts = [\n'
-              '        "-warnings-as-errors",\n'
-              '    ],\n'
-          )
-          new = (
-              '    copts = [\n'
-              '        "-warnings-as-errors",\n'
-              '        # Star Forge: Swift 6.3.3 crashes in CopyPropagation while\n'
-              '        # canonicalizing OSSA lifetimes of the huge init below.\n'
-              '        "-Xllvm",\n'
-              '        "-sil-disable-pass=CopyPropagation",\n'
-              '    ],\n'
-          )
-
-          if old not in source:
-              print('::error::unexpected formatting of the ShareScreen copts block')
-              sys.exit(1)
-
-          with open(path, 'w', encoding='utf-8') as handle:
-              handle.write(source.replace(old, new, 1))
-          print('patched', path)
-          PY
-          grep -n -A 6 'copts = \[' submodules/TelegramUI/Components/ShareScreen/BUILD
+          # That is a compiler bug in OSSA lifetime canonicalization, not a
+          # problem in the code: upstream builds the very same file fine on the
+          # 27.1 toolchain. Every pass that reaches that code path has to be
+          # turned off for this module. They are pure optimizations, so
+          # semantics are unchanged -- only local optimization quality drops.
+          # These two are known offenders; the build step below adds more
+          # automatically if the compiler finds another one to die in.
+          python3 .ci/disable_sil_pass.py CopyPropagation
+          python3 .ci/disable_sil_pass.py SILCombine
+          grep -n -A 14 'copts = \[' submodules/TelegramUI/Components/ShareScreen/BUILD
 
       - name: Restore executable bits on shell scripts
         run: |
@@ -265,23 +235,54 @@ jobs:
 
       - name: Build the app
         run: |
-          set -euxo pipefail
+          set -uxo pipefail
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs || true
+
           # Tee the output so a failure can be summarised as annotations: the
           # raw job log needs a token to read, annotations do not.
-          set +e
-          python3 -u build-system/Make/Make.py \
-            --cacheDir="$HOME/telegram-bazel-cache" \
-            --overrideXcodeVersion \
-            build \
-            --configurationPath=build-system/appstore-configuration.json \
-            --codesigningInformationPath=build-system/fake-codesigning \
-            --configuration=release_arm64 \
-            --buildNumber="${{ inputs.build_number }}" \
-            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          STATUS="${PIPESTATUS[0]}"
-          set -e
+          build_once() {
+            python3 -u build-system/Make/Make.py \
+              --cacheDir="$HOME/telegram-bazel-cache" \
+              --overrideXcodeVersion \
+              build \
+              --configurationPath=build-system/appstore-configuration.json \
+              --codesigningInformationPath=build-system/fake-codesigning \
+              --configuration=release_arm64 \
+              --buildNumber="${{ inputs.build_number }}" \
+              --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts" \
+              2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+            return "${PIPESTATUS[0]}"
+          }
+
+          # The Swift 6.3.3 frontend can die inside OSSA lifetime canonicalization
+          # on a huge function, and each pass that reaches that code path has to
+          # be disabled separately. Instead of babysitting one pass per run, read
+          # the crashing pass out of the log, patch the module's copts, and retry
+          # -- Bazel's disk cache makes the retry resume instead of rebuilding.
+          STATUS=1
+          ATTEMPT=1
+          while [ "$ATTEMPT" -le 6 ]; do
+            echo "=== build attempt $ATTEMPT ==="
+            STATUS=0
+            build_once || STATUS=$?
+            if [ "$STATUS" -eq 0 ]; then
+              echo "build succeeded on attempt $ATTEMPT"
+              break
+            fi
+            PASS="$(grep -o 'While running pass #[0-9]* SILFunctionTransform "[A-Za-z0-9]*"' "$GITHUB_WORKSPACE/build.log" \
+              | tail -n 1 | sed -E 's/.*"([A-Za-z0-9]+)"$/\1/')"
+            if [ -z "$PASS" ]; then
+              echo "no crashing SIL pass in the log; not retrying"
+              break
+            fi
+            echo "::warning::the Swift compiler crashed in the $PASS pass; disabling it and retrying"
+            if ! python3 .ci/disable_sil_pass.py "$PASS"; then
+              echo "::error::could not disable the $PASS pass"
+              break
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
           if [ "$STATUS" -ne 0 ]; then
             echo "build failed with status $STATUS; surfacing errors below"
             grep -n -E "(error:|ERROR:|Error:|fatal error|failed:)" "$GITHUB_WORKSPACE/build.log" \
