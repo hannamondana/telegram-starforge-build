@@ -201,6 +201,9 @@ jobs:
         run: |
           set -euxo pipefail
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs || true
+          # Tee the output so a failure can be summarised as annotations: the
+          # raw job log needs a token to read, annotations do not.
+          set +e
           python3 -u build-system/Make/Make.py \
             --cacheDir="$HOME/telegram-bazel-cache" \
             --overrideXcodeVersion \
@@ -209,7 +212,19 @@ jobs:
             --codesigningInformationPath=build-system/fake-codesigning \
             --configuration=release_arm64 \
             --buildNumber="${{ inputs.build_number }}" \
-            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts"
+            --outputBuildArtifactsPath="$GITHUB_WORKSPACE/build-artifacts" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          STATUS="${PIPESTATUS[0]}"
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "build failed with status $STATUS; surfacing errors below"
+            grep -n -E "(error:|ERROR:|Error:|fatal error|failed:)" "$GITHUB_WORKSPACE/build.log" \
+              | tail -n 40 \
+              | while IFS= read -r line; do
+                  echo "::error::$line"
+                done
+            exit "$STATUS"
+          fi
 
       - name: Locate IPA
         id: locate
