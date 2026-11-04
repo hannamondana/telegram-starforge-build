@@ -103,6 +103,50 @@ jobs:
                   print("::warning::nested submodules for {} not fully fetched: {}".format(path, exc))
           PY
 
+      - name: Apply SDK compatibility patches
+        run: |
+          set -eux
+          # Upstream master is written against the iOS 27.1 SDK, but the newest
+          # Xcode on the hosted runners is 26.6 (iOS 26.5 SDK). `#available`
+          # only guards *runtime* availability -- the compiler still has to
+          # resolve every member against the SDK it is building with, so any
+          # 27.x-only symbol is a hard error. There is exactly one such call in
+          # the tree; stub it out. On a 26.5 SDK the code path could never run
+          # anyway, and returning nil is its documented "not reported" value.
+          python3 - <<'PY'
+          import sys
+
+          path = 'submodules/Display/Source/WindowContent.swift'
+          with open(path, 'r', encoding='utf-8') as handle:
+              source = handle.read()
+
+          old = (
+              '        if #available(iOS 27.1, *) {\n'
+              '            return self.eventView.reservedRegions(kind: .division).first(where: \\.isActive)?.frame\n'
+              '        }\n'
+              '        return nil\n'
+          )
+          new = (
+              '        // Star Forge: built against a pre-27.1 SDK, where\n'
+              '        // `UIView.reservedRegions(kind:)` does not exist. The fold is\n'
+              '        // therefore never reported, which is what this property\n'
+              '        // returns before iOS 27.1 anyway.\n'
+              '        return nil\n'
+          )
+
+          if 'reservedRegions(kind: .division)' not in source:
+              print('Display/WindowContent.swift: no 27.1-only call left to patch')
+              sys.exit(0)
+
+          if old not in source:
+              print('::error::unexpected formatting around the reservedRegions call in ' + path)
+              sys.exit(1)
+
+          with open(path, 'w', encoding='utf-8') as handle:
+              handle.write(source.replace(old, new, 1))
+          print('patched', path)
+          PY
+
       - name: Refresh fake provisioning profiles
         run: |
           set -eux
