@@ -147,6 +147,20 @@ jobs:
           print('patched', path)
           PY
 
+      - name: Restore executable bits on shell scripts
+        run: |
+          set -eux
+          # Git only stores the executable bit in the index, and this repository
+          # was uploaded as plain files, so the bit is gone. Bazel's ffmpeg
+          # genrule copies submodules/ffmpeg/Sources/FFMpeg with `cp -R` and
+          # then executes build-ffmpeg-bazel.sh (which in turn runs configure
+          # and other helpers) from the copy, so the bit has to be set on the
+          # workspace files before the build starts.
+          chmod -R +x submodules/ffmpeg/Sources/FFMpeg
+          find . -path ./.git -prune -o -name '*.sh' -type f -print0 \
+            | xargs -0 -r chmod +x
+          ls -l submodules/ffmpeg/Sources/FFMpeg/build-ffmpeg-bazel.sh
+
       - name: Refresh fake provisioning profiles
         run: |
           set -eux
